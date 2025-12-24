@@ -1,9 +1,10 @@
-# bot.py (БЕЗ БД: всё хранится в data.json)
+\# bot.py (БЕЗ БД: всё хранится в data.json)
 # Требования:
 #   pip install aiogram
 #
 # .env (пример):
 # BOT_TOKEN=...
+# OWNER_ID=123456789
 # LOG_CHAT_ID=-1003610019728
 # LOG_TOPIC_ID=3
 # TEST_CHAT_ID=-1003610019728
@@ -34,7 +35,7 @@ from aiogram.types import (
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 
 # =========================
@@ -87,13 +88,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Put it into .env")
 
+OWNER_ID = env_int_optional("OWNER_ID")  # авто-роль head_admin
+
 # Логи (форум-топик)
 LOG_CHAT_ID = env_int("LOG_CHAT_ID", -1003610019728)
 LOG_TOPIC_ID = env_int("LOG_TOPIC_ID", 3)  # message_thread_id
 
 # Чаты
-TEST_CHAT_ID = env_int_optional("TEST_CHAT_ID")  # -1003610019728
-MAIN_CHAT_ID = env_int_optional("MAIN_CHAT_ID")  # -1003102382326
+TEST_CHAT_ID = env_int_optional("TEST_CHAT_ID")
+MAIN_CHAT_ID = env_int_optional("MAIN_CHAT_ID")
 
 # Файл данных (НЕ БД)
 DATA_PATH = "data.json"
@@ -111,7 +114,7 @@ PAGE_TEXT = "text"
 PAGE_MEDIA = "media"
 PAGE_CLEANUP = "cleanup"
 
-# Сколько хранить активности (чтобы data.json не рос бесконечно)
+# Сколько хранить активности
 ACTIVITY_KEEP_DAYS = 180
 ACTIVITY_MAX_PER_CHAT = 20000
 
@@ -150,20 +153,15 @@ def can_use(role: Optional[str], cmd: str) -> bool:
         return role_at_least(role, ROLE_MOD)
     if cmd in ("ban", "unban"):
         return role_at_least(role, ROLE_ADMIN)
-    if cmd in (
-        "kick",
-        "setrole",
-        "delrole",
-        "automute",
-        "setrules",
-        "setforum",
-        "settings",
-        "inactive",
-    ):
+    if cmd in ("kick", "setrole", "delrole", "automute", "setrules", "setforum", "settings", "inactive"):
         return role_at_least(role, ROLE_HEAD)
     if cmd == "to_main":
         return role_at_least(role, ROLE_MOD)
     return False
+
+
+def wl_allowed(role: Optional[str]) -> bool:
+    return role in (ROLE_CREATOR, ROLE_HEAD)
 
 
 # =========================
@@ -178,17 +176,17 @@ class ChatSettings:
     block_links: bool = True
 
     sticker_mode: str = "limit"  # allow|limit|ban
-    gif_mode: str = "limit"  # allow|limit|ban
+    gif_mode: str = "limit"      # allow|limit|ban
     sticker_limit: int = 4
     gif_limit: int = 3
     media_window_sec: int = 12
 
-    action: str = "mute"  # delete|mute
-    mute_seconds: int = 14400  # 4 часа
+    action: str = "mute"         # delete|mute
+    mute_seconds: int = 14400    # 4 часа
 
     cleanup_enabled: bool = False
     cleanup_days: int = 14
-    cleanup_mode: str = "kick"  # kick|ban
+    cleanup_mode: str = "kick"   # kick|ban
 
 
 DEFAULT = ChatSettings()
@@ -303,12 +301,7 @@ def get_meta_local(chat_id: int) -> Tuple[Optional[int], Optional[int], Optional
     return fc, ft, rt if isinstance(rt, str) else None
 
 
-async def set_meta_local(
-    chat_id: int,
-    forum_chat_id: Optional[int] = None,
-    forum_topic_id: Optional[int] = None,
-    rules_text: Optional[str] = None,
-):
+async def set_meta_local(chat_id: int, forum_chat_id: Optional[int] = None, forum_topic_id: Optional[int] = None, rules_text: Optional[str] = None):
     ck = _chat_key(chat_id)
     if ck not in DATA["meta"] or not isinstance(DATA["meta"][ck], dict):
         DATA["meta"][ck] = {"forum_chat_id": None, "forum_topic_id": None, "rules_text": None}
@@ -375,8 +368,7 @@ def is_whitelisted(chat_id: int, user_id: int) -> bool:
 
 async def whitelist_add(chat_id: int, user_id: int):
     ck = _chat_key(chat_id)
-    if "whitelist" not in DATA or not isinstance(DATA["whitelist"], dict):
-        DATA["whitelist"] = {}
+    DATA.setdefault("whitelist", {})
     if ck not in DATA["whitelist"] or not isinstance(DATA["whitelist"][ck], list):
         DATA["whitelist"][ck] = []
     s = set(map(str, DATA["whitelist"][ck]))
@@ -495,7 +487,7 @@ def fetch_inactive_local(chat_id: int, cutoff_ts: int, limit: int, offset: int) 
         if isinstance(ts, int) and ts < cutoff_ts:
             rows.append((uid, ts))
     rows.sort(key=lambda x: x[1])
-    return rows[offset : offset + limit]
+    return rows[offset: offset + limit]
 
 
 async def add_warn_local(chat_id: int, user_id: int, by_id: int, reason: str) -> int:
@@ -683,7 +675,7 @@ async def display_user_mention(bot: Bot, chat_id: int, user_id: int) -> str:
             return mention_html(user_id, f"@{m.user.username}")
         if m.user.full_name:
             return mention_html(user_id, m.user.full_name)
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
     return mention_html(user_id, str(user_id))
 
@@ -693,9 +685,19 @@ async def get_effective_role(bot: Bot, chat_id: int, user_id: int) -> Optional[s
         member = await bot.get_chat_member(chat_id, user_id)
         if member.status == "creator":
             return ROLE_CREATOR
-    except TelegramBadRequest:
-        pass
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return None
     return get_role_local(chat_id, user_id)
+
+
+async def ensure_owner_role(chat_id: int, user_id: int):
+    # авто-выдача роли "Руководитель админов" владельцу по OWNER_ID
+    if OWNER_ID is None or user_id != OWNER_ID:
+        return
+    cur = get_role_local(chat_id, user_id)
+    if cur != ROLE_HEAD:
+        DATA.setdefault("roles", {}).setdefault(_chat_key(chat_id), {})[_user_key(user_id)] = ROLE_HEAD
+        await save_data()
 
 
 async def resolve_target_user_id(message: Message) -> Optional[int]:
@@ -719,7 +721,7 @@ async def ensure_can_moderate_target(bot: Bot, chat_id: int, actor_id: int, targ
         target = await bot.get_chat_member(chat_id, target_id)
         if target.status in ("creator", "administrator"):
             return False
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
 
     actor_role = await get_effective_role(bot, chat_id, actor_id)
@@ -746,7 +748,7 @@ async def log_action(bot: Bot, chat_id: int, text_html: str):
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
 
 
@@ -757,19 +759,16 @@ async def apply_action(bot: Bot, message: Message, settings: ChatSettings, reaso
     # delete message
     try:
         await message.delete()
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
 
-    # log automod
+    # log automod (включая авто-мут)
     try:
         who = await display_user_mention(bot, message.chat.id, message.from_user.id)
         txt = (message.text or message.caption or "").strip()
         if len(txt) > 180:
             txt = txt[:180] + "…"
-        extra = ""
-        if settings.action == "mute":
-            extra = f"\nСрок: <code>{int(settings.mute_seconds)}</code> сек"
-
+        extra = f"\nСрок: <code>{int(settings.mute_seconds)}</code> сек" if settings.action == "mute" else ""
         await log_action(
             bot,
             message.chat.id,
@@ -784,7 +783,6 @@ async def apply_action(bot: Bot, message: Message, settings: ChatSettings, reaso
     except Exception:
         pass
 
-    # mute
     if settings.action == "mute":
         until = int(time.time()) + int(settings.mute_seconds)
         perms = ChatPermissions(can_send_messages=False)
@@ -795,7 +793,7 @@ async def apply_action(bot: Bot, message: Message, settings: ChatSettings, reaso
                 permissions=perms,
                 until_date=until,
             )
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramForbiddenError):
             pass
 
 
@@ -803,7 +801,6 @@ async def apply_action(bot: Bot, message: Message, settings: ChatSettings, reaso
 # COMMAND HINTS (подсказки команд)
 # =========================
 async def setup_bot_commands(bot: Bot, chat_ids: List[int]):
-    # Telegram API меню принимает только латиницу/цифры/_
     try:
         await bot.set_my_commands(
             commands=[
@@ -873,9 +870,6 @@ def settings_text(s: ChatSettings, page: str) -> str:
             lines.append(f"• Авто-мут: <b>{h(format_duration(s.mute_seconds))}</b> (<code>{s.mute_seconds}</code>с)")
         lines += [
             "",
-            "<i>Можно командой:</i>",
-            "<code>/automute 2h30m</code>",
-            "",
             "<i>Whitelist:</i> пользователи, которых автомод не трогает.",
         ]
 
@@ -897,7 +891,7 @@ def settings_text(s: ChatSettings, page: str) -> str:
             gif_line,
             f"• Окно медиа: <b>{s.media_window_sec}</b> сек",
             "",
-            "<i>Примечание:</i> альбомы (несколько фото одним сообщением) не считаются как флуд/гиф-спам.",
+            "<i>Примечание:</i> альбомы (много фото одним сообщением) не считаются как флуд/GIF-спам.",
         ]
 
     elif page == PAGE_CLEANUP:
@@ -990,16 +984,12 @@ def build_kb_cleanup(s: ChatSettings):
 def build_settings_markup(s: ChatSettings, page: str) -> InlineKeyboardMarkup:
     nav = nav_row(page)
 
-    if page == PAGE_MAIN:
-        section = build_kb_main(s)
-    elif page == PAGE_TEXT:
-        section = build_kb_text(s)
-    elif page == PAGE_MEDIA:
-        section = build_kb_media(s)
-    elif page == PAGE_CLEANUP:
-        section = build_kb_cleanup(s)
-    else:
-        section = build_kb_main(s)
+    section = {
+        PAGE_MAIN: build_kb_main,
+        PAGE_TEXT: build_kb_text,
+        PAGE_MEDIA: build_kb_media,
+        PAGE_CLEANUP: build_kb_cleanup,
+    }.get(page, build_kb_main)(s)
 
     footer = InlineKeyboardBuilder()
     footer.button(text="🔄 Обновить", callback_data=f"ui:page:{page}")
@@ -1061,7 +1051,7 @@ async def render_inactive_list(call: CallbackQuery, bot: Bot, chat_id: int, page
                 note = " (уже не в чате)"
             if member.status in ("administrator", "creator"):
                 note += " (админ)"
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramForbiddenError):
             note = " (недоступно)"
 
         u = await display_user_mention(bot, chat_id, user_id)
@@ -1095,7 +1085,7 @@ async def render_wl_list(call: CallbackQuery, bot: Bot, chat_id: int, page: int)
     total = len(ids)
     page = max(0, page)
     offset = page * WL_PAGE_SIZE
-    chunk = ids[offset : offset + WL_PAGE_SIZE]
+    chunk = ids[offset: offset + WL_PAGE_SIZE]
 
     lines = [
         "👥 <b>Whitelist</b>",
@@ -1140,7 +1130,7 @@ async def run_cleanup_once(bot: Bot, chat_id: int) -> Tuple[int, int]:
                 await bot.unban_chat_member(chat_id, user_id)
 
             removed += 1
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramForbiddenError):
             continue
 
     return processed, removed
@@ -1173,13 +1163,7 @@ async def cleanup_loop(bot: Bot):
 dp = Dispatcher()
 
 
-async def render_settings(
-    bot: Bot,
-    chat_id: int,
-    page: str = PAGE_MAIN,
-    target_message: Optional[Message] = None,
-    edit_cb: Optional[CallbackQuery] = None,
-):
+async def render_settings(bot: Bot, chat_id: int, page: str = PAGE_MAIN, target_message: Optional[Message] = None, edit_cb: Optional[CallbackQuery] = None):
     s = get_settings_local(chat_id)
     text = settings_text(s, page)
     kb = build_settings_markup(s, page)
@@ -1201,6 +1185,7 @@ async def render_settings(
 @dp.message(Command("commands"))
 @dp.message(F.text.regexp(r"^/(команды)(@[\w_]+)?(\s|$)"))
 async def cmd_commands(message: Message):
+    # ВАЖНО: в HTML нельзя писать <время> — экранируем
     txt = (
         "📚 <b>Команды бота</b>\n\n"
         "<b>Для всех:</b>\n"
@@ -1219,11 +1204,11 @@ async def cmd_commands(message: Message):
         "• /unban (reply/@username)\n\n"
         "<b>Руководитель Админов / Создатель:</b>\n"
         "• /kick (reply/@username) причина\n"
-        "• /setrole (reply) <seeker|moderator|admin|head_admin|creator>\n"
+        "• /setrole (reply) <code>seeker|moderator|admin|head_admin|creator</code>\n"
         "• /delrole (reply)\n"
-        "• /automute <время>\n"
-        "• /setrules <текст> (или reply)\n"
-        "• /setforum <chat_id> <topic_id>\n"
+        "• /automute &lt;время&gt;\n"
+        "• /setrules &lt;текст&gt; (или reply)\n"
+        "• /setforum &lt;chat_id&gt; &lt;topic_id&gt;\n"
         "• /settings — настройки антиспама\n"
         "• /inactive — неактивные участники\n"
         "• /wl_add /wl_del /wl_list — whitelist (только Создатель/Руководитель)\n\n"
@@ -1275,7 +1260,7 @@ async def cmd_admins(message: Message, bot: Bot):
             if m.status == "creator":
                 if m.user.id not in by_role[ROLE_CREATOR]:
                     by_role[ROLE_CREATOR].append(m.user.id)
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
 
     lines = ["👮 <b>Администрация</b>", ""]
@@ -1375,10 +1360,7 @@ async def cmd_automute(message: Message, bot: Bot):
     await set_setting_local(message.chat.id, "action", "mute")
     await set_setting_local(message.chat.id, "mute_seconds", sec)
 
-    await message.answer(
-        f"✅ Авто-мут установлен: <b>{h(format_duration(sec))}</b> (<code>{sec}</code>с).",
-        parse_mode="HTML",
-    )
+    await message.answer(f"✅ Авто-мут установлен: <b>{h(format_duration(sec))}</b> (<code>{sec}</code>с).", parse_mode="HTML")
 
     who = await display_user_mention(bot, message.chat.id, message.from_user.id)
     await log_action(
@@ -1400,18 +1382,13 @@ async def cmd_invite(message: Message, bot: Bot):
 
     who = await display_user_mention(bot, message.chat.id, message.from_user.id)
 
-    # seeker: одноразовая ссылка в основную, создаётся только из тестовой
     if role == ROLE_SEEKER:
         if TEST_CHAT_ID is None or MAIN_CHAT_ID is None:
             await message.answer("⚠️ TEST_CHAT_ID / MAIN_CHAT_ID не настроены в .env")
             return
         if message.chat.id != TEST_CHAT_ID:
-            await message.answer(
-                "⛔ Для роли <b>Ищет людей</b> ссылка в основную создаётся только в тестовой группе.",
-                parse_mode="HTML",
-            )
+            await message.answer("⛔ Для роли <b>Ищет людей</b> ссылка в основную создаётся только в тестовой группе.", parse_mode="HTML")
             return
-
         try:
             link = await bot.create_chat_invite_link(
                 chat_id=MAIN_CHAT_ID,
@@ -1419,7 +1396,6 @@ async def cmd_invite(message: Message, bot: Bot):
                 member_limit=1,
             )
             await message.answer(f"🔗 Одноразовая ссылка в основную группу:\n{h(link.invite_link)}", parse_mode="HTML")
-
             await log_action(
                 bot,
                 message.chat.id,
@@ -1433,7 +1409,6 @@ async def cmd_invite(message: Message, bot: Bot):
             await message.answer("Не удалось создать ссылку (нет прав у бота в основной группе).")
         return
 
-    # остальные: ссылка в текущий чат
     try:
         link = await bot.create_chat_invite_link(message.chat.id, name=f"invite by {message.from_user.id}")
         await message.answer(f"🔗 Ссылка для приглашения:\n{h(link.invite_link)}", parse_mode="HTML")
@@ -1500,6 +1475,12 @@ async def cmd_delrole(message: Message, bot: Bot):
         return
 
     target_id = message.reply_to_message.from_user.id
+
+    # Не даём снять роль владельца (опционально, но логично при автоприсвоении)
+    if OWNER_ID is not None and target_id == OWNER_ID:
+        await message.answer("⛔ Нельзя снять роль у владельца (OWNER_ID).")
+        return
+
     await del_role_local(message.chat.id, target_id)
 
     target = await display_user_mention(bot, message.chat.id, target_id)
@@ -1524,6 +1505,8 @@ async def cmd_settings(message: Message, bot: Bot):
     if not message.from_user:
         return
 
+    await ensure_owner_role(message.chat.id, message.from_user.id)
+
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "settings"):
         await message.answer("⛔ Эта команда доступна только Руководителю Админов/Создателю.")
@@ -1539,6 +1522,8 @@ async def cmd_inactive(message: Message, bot: Bot):
         return
     if not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
 
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "inactive"):
@@ -1559,16 +1544,14 @@ async def cmd_inactive(message: Message, bot: Bot):
 # =========================
 # WHITELIST COMMANDS (ТОЛЬКО CREATOR/HEAD)
 # =========================
-def _wl_allowed(role: Optional[str]) -> bool:
-    return role in (ROLE_CREATOR, ROLE_HEAD)
-
-
 @dp.message(Command("wl_add"))
 async def cmd_wl_add(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
-    if not _wl_allowed(role):
+    if not wl_allowed(role):
         await message.answer("⛔ Только Создатель/Руководитель Админов.")
         return
 
@@ -1586,8 +1569,10 @@ async def cmd_wl_add(message: Message, bot: Bot):
 async def cmd_wl_del(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
-    if not _wl_allowed(role):
+    if not wl_allowed(role):
         await message.answer("⛔ Только Создатель/Руководитель Админов.")
         return
 
@@ -1605,8 +1590,10 @@ async def cmd_wl_del(message: Message, bot: Bot):
 async def cmd_wl_list(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
-    if not _wl_allowed(role):
+    if not wl_allowed(role):
         await message.answer("⛔ Только Создатель/Руководитель Админов.")
         return
 
@@ -1620,16 +1607,19 @@ async def cmd_wl_list(message: Message, bot: Bot):
         lines.append(f"• {await display_user_mention(bot, message.chat.id, uid)}")
     if len(ids) > 200:
         lines.append(f"\n…и ещё <b>{len(ids)-200}</b>")
-
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+# =========================
+# CALLBACKS (settings + whitelist UI)
+# =========================
 @dp.callback_query(F.data.startswith("ui:page:"))
 async def cb_ui_page(call: CallbackQuery, bot: Bot):
     if not call.from_user:
         return
     chat_id = call.message.chat.id
 
+    await ensure_owner_role(chat_id, call.from_user.id)
     role = await get_effective_role(bot, chat_id, call.from_user.id)
     if not can_use(role, "settings"):
         await call.answer("Только для Руководителя Админов/Создателя.", show_alert=True)
@@ -1646,15 +1636,14 @@ async def cb_settings(call: CallbackQuery, bot: Bot):
         return
 
     chat_id = call.message.chat.id
+    await ensure_owner_role(chat_id, call.from_user.id)
+
     role = await get_effective_role(bot, chat_id, call.from_user.id)
 
-    # whitelist UI: тоже только creator/head
-    if call.data.startswith("tg:wl_"):
-        if not _wl_allowed(role):
-            await call.answer("Только Создатель/Руководитель.", show_alert=True)
-            return
+    if call.data.startswith("tg:wl_") and not wl_allowed(role):
+        await call.answer("Только Создатель/Руководитель.", show_alert=True)
+        return
 
-    # settings: только head/creator
     if not can_use(role, "settings"):
         await call.answer("Только для Руководителя Админов/Создателя.", show_alert=True)
         return
@@ -1664,14 +1653,14 @@ async def cb_settings(call: CallbackQuery, bot: Bot):
 
     try:
         if data.startswith("tg:inactive_list:"):
-            page = int(data.split(":")[-1])
-            await render_inactive_list(call, bot, chat_id, max(0, page))
+            page = max(0, int(data.split(":")[-1]))
+            await render_inactive_list(call, bot, chat_id, page)
             await call.answer()
             return
 
         if data.startswith("tg:wl_list:"):
-            page = int(data.split(":")[-1])
-            await render_wl_list(call, bot, chat_id, max(0, page))
+            page = max(0, int(data.split(":")[-1]))
+            await render_wl_list(call, bot, chat_id, page)
             await call.answer()
             return
 
@@ -1845,8 +1834,7 @@ async def parse_reason(parts: List[str], start_index: int) -> str:
     return r if r else "без указания"
 
 
-@dp.message(Command("to_main"))
-@dp.message(F.text.regexp(r"^/(перенести|воснову)(@[\w_]+)?(\s|$)"))
+@dp.message(Command("to_main", "перенести", "воснову"))
 async def cmd_to_main(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
@@ -1854,10 +1842,11 @@ async def cmd_to_main(message: Message, bot: Bot):
     if TEST_CHAT_ID is None or MAIN_CHAT_ID is None:
         await message.answer("⚠️ TEST_CHAT_ID / MAIN_CHAT_ID не настроены в .env")
         return
-
     if message.chat.id != TEST_CHAT_ID:
         await message.answer("⛔ Эта команда работает только в тестовой группе.")
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
 
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "to_main"):
@@ -1865,25 +1854,14 @@ async def cmd_to_main(message: Message, bot: Bot):
         return
 
     if not message.reply_to_message:
-        await message.answer(
-            "Использование:\n"
-            "1) Ответь (reply) на сообщение в топике\n"
-            "2) Напиши:\n"
-            "• /to_main\n"
-            "• /перенести\n"
-            "• /перенести --del (скопировать и удалить оригинал)"
-        )
+        await message.answer("Использование: ответь на сообщение и напиши /перенести (или /to_main). Опция: --del")
         return
 
     src = message.reply_to_message
     delete_original = "--del" in (message.text or "")
 
     try:
-        await bot.copy_message(
-            chat_id=MAIN_CHAT_ID,
-            from_chat_id=message.chat.id,
-            message_id=src.message_id,
-        )
+        await bot.copy_message(chat_id=MAIN_CHAT_ID, from_chat_id=message.chat.id, message_id=src.message_id)
     except TelegramBadRequest:
         await message.answer("❌ Не удалось отправить в основную (проверь права бота в основной группе).")
         return
@@ -1931,6 +1909,8 @@ async def cmd_mute(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
 
+    await ensure_owner_role(message.chat.id, message.from_user.id)
+
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "mute"):
         await message.answer("⛔ Недостаточно прав для /mute.")
@@ -1939,15 +1919,7 @@ async def cmd_mute(message: Message, bot: Bot):
     parts = split_command_args(message.text or "")
     target_id = await resolve_target_user_id(message)
     if not target_id:
-        await message.answer(
-            "Использование:\n"
-            "• reply: /mute 10m причина\n"
-            "• /mute @username 10m причина\n"
-            "• /mute <user_id> 10m причина\n\n"
-            "Пример:\n"
-            "<code>/mute \"@UserName\" \"10m\" \"спам\"</code>",
-            parse_mode="HTML",
-        )
+        await message.answer("Использование:\n• reply: /mute 10m причина\n• /mute @username 10m причина", parse_mode="HTML")
         return
 
     if not await ensure_can_moderate_target(bot, message.chat.id, message.from_user.id, target_id):
@@ -2004,6 +1976,8 @@ async def cmd_unmute(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
 
+    await ensure_owner_role(message.chat.id, message.from_user.id)
+
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "unmute"):
         await message.answer("⛔ Недостаточно прав для /unmute.")
@@ -2041,17 +2015,15 @@ async def cmd_unmute(message: Message, bot: Bot):
     target = await display_user_mention(bot, message.chat.id, target_id)
 
     await message.answer(f"✅ Пользователь {target} был <b>размучен</b>.", parse_mode="HTML")
-    await log_action(
-        bot,
-        message.chat.id,
-        f"🔊 <b>UNMUTE</b>\nЧат: <code>{message.chat.id}</code>\nКто: {actor}\nКого: {target}",
-    )
+    await log_action(bot, message.chat.id, f"🔊 <b>UNMUTE</b>\nЧат: <code>{message.chat.id}</code>\nКто: {actor}\nКого: {target}")
 
 
 @dp.message(Command("ban"))
 async def cmd_ban(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
 
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "ban"):
@@ -2061,14 +2033,7 @@ async def cmd_ban(message: Message, bot: Bot):
     parts = split_command_args(message.text or "")
     target_id = await resolve_target_user_id(message)
     if not target_id:
-        await message.answer(
-            "Использование:\n"
-            "• reply: /ban 7d причина (время опционально)\n"
-            "• /ban @username 7d причина\n"
-            "• /ban <user_id> 7d причина\n\n"
-            "Пример:\n<code>/ban \"@UserName\" \"7d\" \"реклама\"</code>",
-            parse_mode="HTML",
-        )
+        await message.answer("Использование:\n• reply: /ban 7d причина\n• /ban @username 7d причина", parse_mode="HTML")
         return
 
     if not await ensure_can_moderate_target(bot, message.chat.id, message.from_user.id, target_id):
@@ -2083,17 +2048,17 @@ async def cmd_ban(message: Message, bot: Bot):
             maybe = parse_duration_to_seconds(parts[1])
             if maybe:
                 dur = maybe
-                reason = await parse_reason(parts, 2)
+                reason = " ".join(parts[2:]).strip() or reason
             else:
-                reason = await parse_reason(parts, 1)
+                reason = " ".join(parts[1:]).strip() or reason
     else:
         if len(parts) >= 3:
             maybe = parse_duration_to_seconds(parts[2])
             if maybe:
                 dur = maybe
-                reason = await parse_reason(parts, 3)
+                reason = " ".join(parts[3:]).strip() or reason
             else:
-                reason = await parse_reason(parts, 2)
+                reason = " ".join(parts[2:]).strip() or reason
 
     until = 0
     dur_txt = "навсегда"
@@ -2131,6 +2096,8 @@ async def cmd_unban(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
 
+    await ensure_owner_role(message.chat.id, message.from_user.id)
+
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "unban"):
         await message.answer("⛔ Недостаточно прав для /unban.")
@@ -2155,17 +2122,15 @@ async def cmd_unban(message: Message, bot: Bot):
     target = await display_user_mention(bot, message.chat.id, target_id)
 
     await message.answer(f"✅ Пользователь {target} был <b>разблокирован</b>.", parse_mode="HTML")
-    await log_action(
-        bot,
-        message.chat.id,
-        f"✅ <b>UNBAN</b>\nЧат: <code>{message.chat.id}</code>\nКто: {actor}\nКого: {target}",
-    )
+    await log_action(bot, message.chat.id, f"✅ <b>UNBAN</b>\nЧат: <code>{message.chat.id}</code>\nКто: {actor}\nКого: {target}")
 
 
 @dp.message(Command("kick"))
 async def cmd_kick(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
 
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "kick"):
@@ -2182,10 +2147,8 @@ async def cmd_kick(message: Message, bot: Bot):
         return
 
     parts = split_command_args(message.text or "")
-    if message.reply_to_message:
-        reason = await parse_reason(parts, 1)
-    else:
-        reason = await parse_reason(parts, 2)
+    reason = " ".join(parts[1:]).strip() if message.reply_to_message else " ".join(parts[2:]).strip()
+    reason = reason or "без указания"
 
     try:
         await bot.ban_chat_member(message.chat.id, target_id)
@@ -2197,24 +2160,16 @@ async def cmd_kick(message: Message, bot: Bot):
     actor = await display_user_mention(bot, message.chat.id, message.from_user.id)
     target = await display_user_mention(bot, message.chat.id, target_id)
 
-    await message.answer(
-        f"👢 Пользователь {target} был <b>исключён</b>.\nПричина: <code>{h(reason)}</code>",
-        parse_mode="HTML",
-    )
-
-    await log_action(
-        bot,
-        message.chat.id,
-        f"👢 <b>KICK</b>\nЧат: <code>{message.chat.id}</code>\n"
-        f"Кто: {actor}\nКого: {target}\n"
-        f"Причина: <code>{h(reason)}</code>",
-    )
+    await message.answer(f"👢 Пользователь {target} был <b>исключён</b>.\nПричина: <code>{h(reason)}</code>", parse_mode="HTML")
+    await log_action(bot, message.chat.id, f"👢 <b>KICK</b>\nЧат: <code>{message.chat.id}</code>\nКто: {actor}\nКого: {target}\nПричина: <code>{h(reason)}</code>")
 
 
 @dp.message(Command("warn"))
 async def cmd_warn(message: Message, bot: Bot):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not message.from_user:
         return
+
+    await ensure_owner_role(message.chat.id, message.from_user.id)
 
     role = await get_effective_role(bot, message.chat.id, message.from_user.id)
     if not can_use(role, "warn"):
@@ -2224,62 +2179,30 @@ async def cmd_warn(message: Message, bot: Bot):
     parts = split_command_args(message.text or "")
     target_id = await resolve_target_user_id(message)
     if not target_id:
-        await message.answer(
-            "Использование:\n"
-            "• reply: /warn причина\n"
-            "• /warn @username причина\n"
-            "• /warn <user_id> причина\n\n"
-            "Пример:\n<code>/warn \"@UserName\" \"оскорбления\"</code>",
-            parse_mode="HTML",
-        )
+        await message.answer("Использование:\n• reply: /warn причина\n• /warn @username причина\n• /warn <user_id> причина", parse_mode="HTML")
         return
 
     if not await ensure_can_moderate_target(bot, message.chat.id, message.from_user.id, target_id):
         await message.answer("⛔ Нельзя применить действие к этому пользователю.")
         return
 
-    if message.reply_to_message:
-        reason = await parse_reason(parts, 1)
-    else:
-        reason = await parse_reason(parts, 2)
+    reason = " ".join(parts[1:]).strip() if message.reply_to_message else " ".join(parts[2:]).strip()
+    reason = reason or "без указания"
 
     cnt = await add_warn_local(message.chat.id, target_id, message.from_user.id, reason)
 
     actor = await display_user_mention(bot, message.chat.id, message.from_user.id)
     target = await display_user_mention(bot, message.chat.id, target_id)
 
-    await message.answer(
-        f"⚠️ Пользователь {target} получил <b>WARN</b> (#{cnt}).\nПричина: <code>{h(reason)}</code>",
-        parse_mode="HTML",
-    )
+    await message.answer(f"⚠️ Пользователь {target} получил <b>WARN</b> (#{cnt}).\nПричина: <code>{h(reason)}</code>", parse_mode="HTML")
+    await log_action(bot, message.chat.id, f"⚠️ <b>WARN</b>\nЧат: <code>{message.chat.id}</code>\nКто: {actor}\nКого: {target}\nНомер: <code>#{cnt}</code>\nПричина: <code>{h(reason)}</code>")
 
-    await log_action(
-        bot,
-        message.chat.id,
-        f"⚠️ <b>WARN</b>\nЧат: <code>{message.chat.id}</code>\n"
-        f"Кто: {actor}\nКого: {target}\n"
-        f"Номер: <code>#{cnt}</code>\n"
-        f"Причина: <code>{h(reason)}</code>",
-    )
-
-    # Авто-наказание: после каждого 3-го warn — мут на 1 час
     if cnt % 3 == 0:
         auto_mute_sec = 3600
         until = int(time.time()) + auto_mute_sec
         perms = ChatPermissions(can_send_messages=False)
         try:
             await bot.restrict_chat_member(message.chat.id, target_id, permissions=perms, until_date=until)
-
-            await message.answer(
-                "🔇 <b>Авто-наказание</b>\n"
-                f"Пользователь: {target}\n"
-                f"Warn: <b>{cnt}</b>\n"
-                f"Мут: <b>1 час</b>\n"
-                f"Основание: <b>3 предупреждения</b>\n"
-                f"Последняя причина warn: <code>{h(reason)}</code>",
-                parse_mode="HTML",
-            )
-
             await log_action(
                 bot,
                 message.chat.id,
@@ -2288,7 +2211,7 @@ async def cmd_warn(message: Message, bot: Bot):
                 f"Кто выдал warn: {actor}\n"
                 f"Кого: {target}\n"
                 f"Warn count: <code>{cnt}</code>\n"
-                f"Срок: <code>3600</code> сек\n"
+                f"Срок: <code>{auto_mute_sec}</code> сек\n"
                 f"Основание: <code>3 предупреждения</code>\n"
                 f"Последняя причина warn: <code>{h(reason)}</code>",
             )
@@ -2306,15 +2229,21 @@ async def moderate_all(message: Message, bot: Bot):
     if not message.from_user or message.from_user.is_bot:
         return
 
-    await upsert_activity_local(message.chat.id, message.from_user.id, int(time.time()), message.from_user.username)
+    cid = message.chat.id
+    uid = message.from_user.id
+    now = time.time()
 
-    s = get_settings_local(message.chat.id)
+    # если бот больше не в группе — не падаем
+    try:
+        await upsert_activity_local(cid, uid, int(now), message.from_user.username)
+    except Exception:
+        pass
+
+    await ensure_owner_role(cid, uid)
+
+    s = get_settings_local(cid)
     if not s.enabled:
         return
-
-    uid = message.from_user.id
-    cid = message.chat.id
-    now = time.time()
 
     # whitelist: полностью не трогаем
     if is_whitelisted(cid, uid):
@@ -2325,27 +2254,24 @@ async def moderate_all(message: Message, bot: Bot):
     if role and role_at_least(role, ROLE_MOD):
         return
 
+    # Telegram админов тоже не трогаем
     try:
         member = await bot.get_chat_member(cid, uid)
         if member.status in ("administrator", "creator"):
             return
-    except TelegramBadRequest:
-        pass
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return
 
-    # --- FIX: альбомы (media_group) считаем как 1 событие, чтобы не мутить за пачку фото ---
+    # --- FIX: альбомы (media_group) считаем как 1 событие ---
     mgid = getattr(message, "media_group_id", None)
     if mgid:
         seen = album_seen[cid][uid]
         key = str(mgid)
-
-        # все элементы кроме первого — игнорируем
         if key in seen:
             return
-
-        # первый элемент: отметили и проверили caption на ссылку
         seen[key] = now
         if len(seen) > 300:
-            for k, ts in sorted(seen.items(), key=lambda x: x[1])[:100]:
+            for k, _ts in sorted(seen.items(), key=lambda x: x[1])[:100]:
                 seen.pop(k, None)
 
         cap = norm_text(message.caption or "")
@@ -2355,11 +2281,10 @@ async def moderate_all(message: Message, bot: Bot):
 
     # stickers
     if message.sticker:
-        mode = s.sticker_mode
-        if mode == "ban":
+        if s.sticker_mode == "ban":
             await apply_action(bot, message, s, "sticker_ban")
             return
-        if mode == "limit":
+        if s.sticker_mode == "limit":
             dq = sticker_times[cid][uid]
             dq.append(now)
             while dq and (now - dq[0]) > s.media_window_sec:
@@ -2369,13 +2294,12 @@ async def moderate_all(message: Message, bot: Bot):
                 return
         return
 
-    # animations/gif/video-as-animation
+    # GIF animation
     if message.animation:
-        mode = s.gif_mode
-        if mode == "ban":
+        if s.gif_mode == "ban":
             await apply_action(bot, message, s, "gif_ban")
             return
-        if mode == "limit":
+        if s.gif_mode == "limit":
             dq = gif_times[cid][uid]
             dq.append(now)
             while dq and (now - dq[0]) > s.media_window_sec:
@@ -2385,7 +2309,7 @@ async def moderate_all(message: Message, bot: Bot):
                 return
         return
 
-    # text / caption
+    # text/caption
     text = message.text or message.caption or ""
     tnorm = norm_text(text)
 
@@ -2420,6 +2344,14 @@ async def moderate_all(message: Message, bot: Bot):
 async def main():
     await load_data()
 
+    # при старте: если OWNER_ID задан — заранее гарантируем роль в чатах, где есть настройки
+    if OWNER_ID is not None:
+        for ck in list((DATA.get("settings") or {}).keys()):
+            try:
+                await ensure_owner_role(int(ck), OWNER_ID)
+            except Exception:
+                pass
+
     bot = Bot(BOT_TOKEN)
     try:
         chat_ids = [cid for cid in [TEST_CHAT_ID, MAIN_CHAT_ID] if isinstance(cid, int)]
@@ -2436,3 +2368,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
